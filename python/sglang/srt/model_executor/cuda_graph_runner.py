@@ -389,7 +389,7 @@ class CudaGraphRunner:
             self.next_token_logits_buffer = torch.zeros(
                 (self.max_num_token, self.model_runner.model_config.vocab_size),
                 dtype=torch.float,
-                device="cuda",
+                device=model_runner.device,
             )
 
         # Capture
@@ -674,15 +674,10 @@ class CudaGraphRunner:
 
         self._capture_init(run_once)
 
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(torch.cuda.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
-        with torch.cuda.graph(
-            graph, pool=get_global_graph_memory_pool(), stream=stream
-        ):
-            out = run_once()
+        global global_graph_memory_pool
+        out = self._capture_graph(graph, global_graph_memory_pool, stream, run_once)
 
+        global_graph_memory_pool = graph.pool()
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
