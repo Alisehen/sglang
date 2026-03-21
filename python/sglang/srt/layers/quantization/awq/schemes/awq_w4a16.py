@@ -6,9 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import AWQLinearKernel
-from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
-    AWQAscendLinearKernel,
-)
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 
 from .awq_scheme import AWQLinearSchemeBase
@@ -101,4 +98,8 @@ class AWQLinearScheme(AWQLinearSchemeBase):
 class AWQAscendLinearScheme(AWQLinearScheme):
     def __init__(self, quant_config: "AWQConfig"):
         super().__init__(quant_config)
+        from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
+            AWQAscendLinearKernel,
+        )
+
         self.kernel = AWQAscendLinearKernel(quant_config)

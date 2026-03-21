@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.awq_kernels import AWQAscendMoEKernel
 from sglang.srt.layers.moe import MoeRunnerConfig
 
 from .awq_moe import AWQMoEScheme
@@ -19,6 +18,10 @@ __all__ = ["AWQAscendMoEScheme"]
 class AWQAscendMoEScheme(AWQMoEScheme):
     def __init__(self, quant_config: "AWQConfig"):
         super().__init__(quant_config)
+        from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
+            AWQAscendMoEKernel,
+        )
+
         self.kernel = AWQAscendMoEKernel(quant_config)
 
     def create_moe_runner(
