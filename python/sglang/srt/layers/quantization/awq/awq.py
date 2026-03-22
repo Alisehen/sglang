@@ -140,10 +140,10 @@ class AWQConfig(QuantizationConfig):
                 if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                     return UnquantizedLinearMethod()
                 layer.scheme = self.get_linear_scheme(layer)
-                return AWQLinearAscendMethod(self)
+                return AWQLinearMethod(self)
             elif isinstance(layer, FusedMoE):
                 layer.scheme = self.get_moe_scheme(layer)
-                return AWQMoEAscendMethod(self)
+                return AWQMoEMethod(self)
             return None
 
         if isinstance(layer, LinearBase):
@@ -300,7 +300,7 @@ class AWQMarlinConfig(QuantizationConfig):
                     layer, prefix
                 )
             layer.scheme = self.get_linear_scheme(layer)
-            return AWQMarlinLinearMethod(self)
+            return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
@@ -391,64 +391,6 @@ class AWQLinearMethod(LinearMethodBase):
         return layer.scheme.apply_weights(layer, x, bias)
 
 
-class AWQMarlinLinearMethod(LinearMethodBase):
-    """Linear method for AWQ Marlin.
-
-    Args:
-        quant_config: The AWQ Marlin quantization config.
-    """
-
-    def __init__(self, quant_config: AWQMarlinConfig) -> None:
-        self.quant_config = quant_config
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        layer.scheme.create_weights(
-            layer=layer,
-            input_size_per_partition=input_size_per_partition,
-            output_partition_sizes=output_partition_sizes,
-            input_size=input_size,
-            output_size=output_size,
-            params_dtype=params_dtype,
-            weight_loader=weight_loader,
-        )
-
-    # TODO: Update this docs
-    # Checkpoints are serialized in AutoAWQ format, which is different from the
-    # marlin format. This function is called after the weights are loaded.
-    # Here, we handle the repacking
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.scheme.process_weights_after_loading(layer)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return layer.scheme.apply_weights(layer, x, bias)
-
-
-class AWQLinearAscendMethod(AWQLinearMethod):
-    """Linear method for AWQ on Ascend.
-
-    Args:
-        quant_config: The AWQ quantization config.
-    """
-
-    def __init__(self, quant_config: AWQConfig):
-        super().__init__(quant_config)
-
-
 class AWQMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: AWQMarlinConfig):
@@ -489,11 +431,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         return layer.scheme.apply_weights(layer, dispatch_output)
-
-
-class AWQMoEAscendMethod(AWQMoEMethod):
-    def __init__(self, quant_config: AWQConfig):
-        self.quant_config = quant_config
 
 
 # Register fake implementations for torch.compile support
