@@ -16,7 +16,6 @@
 
 import logging
 import re
-from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
@@ -29,7 +28,6 @@ from transformers.activations import ACT2FN
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
     FLASHINFER_MAX_SEQLEN_BUCKETS,
@@ -67,23 +65,13 @@ from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.utils import (
     RotaryPosMixin,
     WeightsMapper,
-    compute_cu_seqlens_from_grid_numpy,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
-graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
-        ViTNpuGraphRunner,
-    )
-
-    graph_runners_dict["npu"] = ViTNpuGraphRunner
-
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +199,6 @@ class Qwen3_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
-        output_ws: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -222,7 +209,6 @@ class Qwen3_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
-            output_ws=output_ws,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
@@ -402,7 +388,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.tp_size = (
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
-        self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -732,10 +717,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if _is_npu:
-                return self.forward_with_npu_graph(x, grid_thw)
-            return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -837,54 +818,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
-    def forward_with_npu_graph(
-        self,
-        x: torch.Tensor,
-        grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
-        (
-            x,
-            cu_seqlens,
-            rotary_pos_emb_cos,
-            rotary_pos_emb_sin,
-        ) = self._prepare_graph_inputs(x, grid_thw)
-
-        cu_seqlens = cu_seqlens.to("cpu")
-        return self.graph_runners.run(
-            x=x,
-            rotary_pos_emb_cos=rotary_pos_emb_cos,
-            rotary_pos_emb_sin=rotary_pos_emb_sin,
-            cu_seqlens=cu_seqlens,
-            output_indices=None,
-        )
-
-    def forward_with_cuda_graph(
-        self,
-        x: torch.Tensor,
-        grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
-        (
-            x,
-            cu_seqlens,
-            rotary_pos_emb_cos,
-            rotary_pos_emb_sin,
-        ) = self._prepare_graph_inputs(x, grid_thw)
-        if not isinstance(cu_seqlens, torch.Tensor):
-            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
-        else:
-            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
-        cu_seqlens = cu_seqlens.contiguous()
-
-        return self.graph_runners.run(
-            x=x,
-            position_embeddings=None,
-            rotary_pos_emb_cos=rotary_pos_emb_cos,
-            rotary_pos_emb_sin=rotary_pos_emb_sin,
-            cu_seqlens=cu_seqlens,
-            cu_window_seqlens=None,
-            output_indices=None,
-        )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -911,32 +844,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        # patchify
-        x = x.to(device=self.device, dtype=self.dtype)
-        x = self.patch_embed(x)
-
-        if isinstance(grid_thw, list):
-            grid_thw_list = grid_thw
-            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
-        else:
-            grid_thw_list = grid_thw.tolist()
-
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        x += pos_embeds
-
-        # rotary embedding -> (cos, sin)
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
-
-        # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        return x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
 
 
 cached_get_processor = lru_cache(get_processor)

@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
@@ -337,42 +336,23 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if "output_ws" not in kwargs:
-                raise RuntimeError("output_ws should be prepared for cuda-graph mode")
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
+        # [b * s, head, head_size]
+        output = torch.empty_like(q)
 
-            output = kwargs["output_ws"]
-            context_attention_fwd(
-                q,
-                k,
-                v,
-                output,
-                cu_seqlens[0],
-                cu_seqlens[1],
-                cu_seqlens[2],
-                is_causal=False,
-            )
-        else:
-            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
-
-            # [b * s, head, head_size]
-            output = torch.empty_like(q)
-
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
-            context_attention_fwd(
-                q,
-                k,
-                v,
-                output,
-                cu_seqlens.to(q.device),
-                seq_lens.to(q.device),
-                max_seqlen,
-                is_causal=False,
-            )
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+        context_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            cu_seqlens.to(q.device),
+            seq_lens.to(q.device),
+            max_seqlen,
+            is_causal=False,
+        )
 
         return output
 
@@ -406,32 +386,20 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            max_seqlen = cu_seqlens[1]
-            output = flash_attn_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens[0],
-                cu_seqlens_k=cu_seqlens[0],
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-            )
-        else:
-            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
-            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
 
-            output = flash_attn_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-            )
+        output = flash_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+        )
 
         return output
 
@@ -680,19 +648,12 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if "output_ws" not in kwargs:
-                raise RuntimeError("output_ws should be prepared for npu-graph mode")
-            output = kwargs["output_ws"]
-            # graph mode: runner already passes seq_lens (int32 on CPU)
-            seq_len_arg = cu_seqlens
-        else:
-            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
-            output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        if seq_lens.is_npu:
+            seq_lens = seq_lens.to("cpu")
+        output = torch.empty_like(q)
+        seq_len_arg = seq_lens.to(torch.int32)
 
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
@@ -1002,7 +963,6 @@ class VisionAttention(nn.Module):
         head = self.num_attention_heads_per_partition
         kv_head = self.num_attention_kv_heads_per_partition
 
-        attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
         max_seqlen = kwargs["max_seqlen"] if "max_seqlen" in kwargs else None
         sequence_lengths = (
             kwargs["sequence_lengths"] if "sequence_lengths" in kwargs else None
@@ -1115,7 +1075,6 @@ class VisionAttention(nn.Module):
             attention_mask=attention_mask,
             sequence_lengths=sequence_lengths,
             max_seqlen=max_seqlen,
-            output_ws=attn_output_ws,
         )
 
         assert output.dim() == 3, output.shape
