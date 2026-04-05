@@ -48,7 +48,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -178,6 +182,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -190,6 +195,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -449,6 +455,13 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
             cu_window_seqlens = cu_window_seqlens.to("cpu")
+
+        # pre-compute attention metadata once for all layers (two variants)
+        full_metadata = prepare_vision_attention_metadata(cu_seqlens, device=x.device)
+        window_metadata = prepare_vision_attention_metadata(
+            cu_window_seqlens, device=x.device
+        )
+
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
@@ -457,10 +470,15 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                 fullatt_indexes = fullatt_indexes.tolist()
             if layer_num in fullatt_indexes:
                 cu_seqlens_now = cu_seqlens
+                metadata_now = full_metadata
             else:
                 cu_seqlens_now = cu_window_seqlens
+                metadata_now = window_metadata
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                forward_metadata=metadata_now,
             )
 
         # adapter

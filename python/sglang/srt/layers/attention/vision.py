@@ -101,17 +101,39 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 
 
 @dataclasses.dataclass
-class SingletonCache:
-    data: Any = None
+class VisionAttentionMetadata:
 
-    def set_data(self, value: Any) -> None:
-        self.data = value
+    cu_seqlens: torch.Tensor
+    seq_lens: torch.Tensor
+    max_seqlen: int
 
-    def get_data(self) -> Optional[Any]:
-        return self.data
+    # flashinfer_cudnn specific (optional)
+    packed_indptrs: Optional[torch.Tensor] = None
+    sequence_lengths: Optional[torch.Tensor] = None
+    flashinfer_max_seqlen: Optional[int] = None
 
-    def empty(self) -> bool:
-        return self.get_data() is None
+
+def prepare_vision_attention_metadata(
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    *,
+    packed_indptrs: Optional[torch.Tensor] = None,
+    sequence_lengths: Optional[torch.Tensor] = None,
+    flashinfer_max_seqlen: Optional[int] = None,
+) -> VisionAttentionMetadata:
+    # Compute all attention metadata once before the encoder layer loop.
+
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = int(seq_lens.max().item())
+    return VisionAttentionMetadata(
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        max_seqlen=max_seqlen,
+        packed_indptrs=packed_indptrs,
+        sequence_lengths=sequence_lengths,
+        flashinfer_max_seqlen=flashinfer_max_seqlen,
+    )
 
 
 # TODO: requires real seqlens from images
@@ -132,24 +154,15 @@ def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Ten
 
 
 def resolve_seqlens(
-    cu_seqlens: torch.Tensor | SingletonCache | None,
+    cu_seqlens: Optional[torch.Tensor],
     bsz: int,
     seq_len: int,
     *,
     device: torch.device,
 ) -> torch.Tensor:
     if cu_seqlens is None:
-        resolved_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
-    elif isinstance(cu_seqlens, SingletonCache):
-        if cu_seqlens.empty():
-            cu_seqlens.set_data(_get_cu_seqlens_for_shape(bsz, seq_len, device=device))
-        resolved_seqlens = cu_seqlens.get_data()
-    else:
-        resolved_seqlens = cu_seqlens
-    assert isinstance(
-        resolved_seqlens, torch.Tensor
-    ), "cu_seqlens must be a torch.Tensor"
-    return resolved_seqlens
+        return _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
+    return cu_seqlens
 
 
 class VisionSdpaAttention(nn.Module):
@@ -325,9 +338,10 @@ class VisionTritonAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -336,20 +350,25 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        if forward_metadata is not None:
+            cu_seqlens_gpu = forward_metadata.cu_seqlens
+            seq_lens = forward_metadata.seq_lens
+            max_seqlen = forward_metadata.max_seqlen
+        else:
+            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
+            max_seqlen = seq_lens.max().item()
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
 
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
         context_attention_fwd(
             q,
             k,
             v,
             output,
-            cu_seqlens.to(q.device),
-            seq_lens.to(q.device),
+            cu_seqlens_gpu,
+            seq_lens,
             max_seqlen,
             is_causal=False,
         )
@@ -375,9 +394,10 @@ class VisionFlash3Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -386,17 +406,21 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if forward_metadata is not None:
+            cu_seqlens_gpu = forward_metadata.cu_seqlens
+            max_seqlen = forward_metadata.max_seqlen
+        else:
+            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
+            max_seqlen = seq_lens.max().item()
 
         output = flash_attn_func(
             q,
             k,
             v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_q=cu_seqlens_gpu,
+            cu_seqlens_k=cu_seqlens_gpu,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
         )
@@ -418,9 +442,10 @@ class VisionFlash4Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -429,25 +454,22 @@ class VisionFlash4Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
-
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if forward_metadata is not None:
+            cu_seqlens_gpu = forward_metadata.cu_seqlens
+            max_seqlen = forward_metadata.max_seqlen
+        else:
+            if cu_seqlens is None:
+                cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+            cu_seqlens_gpu = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
+            max_seqlen = seq_lens.max().item()
 
         output = flash_attn_func(
             q,
             k,
             v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_q=cu_seqlens_gpu,
+            cu_seqlens_k=cu_seqlens_gpu,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             ver=4,
@@ -473,9 +495,10 @@ class VisionFlashInferAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -484,17 +507,23 @@ class VisionFlashInferAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if "sequence_lengths" not in kwargs:
-            raise RuntimeError(
-                "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
-            )
-        if "max_seqlen" not in kwargs:
-            raise RuntimeError(
-                "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
-            )
-
-        sequence_lengths = kwargs["sequence_lengths"]  # (B_padded,) or (B_padded,1,1,1)
-        max_seqlen = kwargs["max_seqlen"]
+        # ---- resolve sequence_lengths, packed indptrs, max_seqlen ----
+        if forward_metadata is not None and forward_metadata.packed_indptrs is not None:
+            sequence_lengths = forward_metadata.sequence_lengths
+            packed_cu_seqlens = forward_metadata.packed_indptrs
+            max_seqlen = forward_metadata.flashinfer_max_seqlen
+        else:
+            if "sequence_lengths" not in kwargs:
+                raise RuntimeError(
+                    "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
+                )
+            if "max_seqlen" not in kwargs:
+                raise RuntimeError(
+                    "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
+                )
+            sequence_lengths = kwargs["sequence_lengths"]
+            packed_cu_seqlens = cu_seqlens
+            max_seqlen = kwargs["max_seqlen"]
 
         # max_seqlen must be python int
         if isinstance(max_seqlen, torch.Tensor):
@@ -511,7 +540,7 @@ class VisionFlashInferAttention(nn.Module):
             reshape_batch_size = q.shape[0]
             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
 
-        if not isinstance(cu_seqlens, torch.Tensor):
+        if not isinstance(packed_cu_seqlens, torch.Tensor):
             raise RuntimeError(
                 "flashinfer_cudnn expects packed indptrs as a torch.Tensor"
             )
@@ -524,7 +553,9 @@ class VisionFlashInferAttention(nn.Module):
 
         # cu_seqlens contains packed *element indptrs*:
         # [qk_indptr(B+1), v_indptr(B+1), o_indptr(B+1)] => total 3*(B+1)
-        cu_seqlens_1d = cu_seqlens.view(-1).to(device=q.device, dtype=torch.int32)
+        cu_seqlens_1d = packed_cu_seqlens.view(-1).to(
+            device=q.device, dtype=torch.int32
+        )
         expected = 3 * (B + 1)
         if int(cu_seqlens_1d.numel()) != expected:
             raise RuntimeError(
@@ -600,23 +631,27 @@ class VisionAiterAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
-
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if forward_metadata is not None:
+            cu_seqlens_gpu = forward_metadata.cu_seqlens
+            max_seqlen = forward_metadata.max_seqlen
+        else:
+            cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
+            max_seqlen = seq_lens.max().item()
 
         return self.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_q=cu_seqlens_gpu,
+            cu_seqlens_k=cu_seqlens_gpu,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
         )
@@ -637,9 +672,10 @@ class VisionAscendAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -648,10 +684,16 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        if seq_lens.is_npu:
-            seq_lens = seq_lens.to("cpu")
+        if forward_metadata is not None:
+            seq_lens = forward_metadata.seq_lens
+            if seq_lens.is_npu:
+                seq_lens = seq_lens.to("cpu")
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            if seq_lens.is_npu:
+                seq_lens = seq_lens.to("cpu")
+
         output = torch.empty_like(q)
         seq_len_arg = seq_lens.to(torch.int32)
 
@@ -937,6 +979,7 @@ class VisionAttention(nn.Module):
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -1073,6 +1116,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            forward_metadata=forward_metadata,
             sequence_lengths=sequence_lengths,
             max_seqlen=max_seqlen,
         )
