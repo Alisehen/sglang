@@ -16,7 +16,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
-from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -25,11 +24,17 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_xpu = is_xpu()
+awq_marlin_moe_repack = None
+awq_marlin_repack = None
 
-if _is_cuda:
+
+def _unsupported_awq_dequantize(*args, **kwargs):
+    raise RuntimeError("AWQ GPU kernels are unavailable on the current platform.")
+
+
+awq_dequantize = _unsupported_awq_dequantize
+
+try:
     from sglang.jit_kernel.awq_dequantize import awq_dequantize
     from sglang.jit_kernel.awq_marlin_repack import (
         awq_marlin_moe_repack,
@@ -43,12 +48,16 @@ if _is_cuda:
             qweight.shape[:-1] + (qweight.shape[-1] * 8,), dtype=scales.dtype
         ),
     )
-elif _is_hip:
-    from sglang.srt.layers.quantization.awq.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
-elif _is_xpu:
-    from sgl_kernel import awq_dequantize
+except ImportError:
+    try:
+        from sglang.srt.layers.quantization.awq.awq_triton import (
+            awq_dequantize_triton as awq_dequantize,
+        )
+    except ImportError:
+        try:
+            from sgl_kernel import awq_dequantize
+        except ImportError:
+            pass
 
 _, scalar_types = get_scalar_types()
 
