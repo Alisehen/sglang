@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
+    _compute_pad_value,
 )
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -395,6 +396,111 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_grid_thw=video_grid_thw,
         )
         return mrope_positions.squeeze(1), mrope_position_delta
+
+    def _extract_grid_tensor(self, data_list, grid_key: str):
+        if not data_list:
+            return None
+
+        grids = []
+        for item in data_list:
+            if not isinstance(item, dict):
+                return None
+            grid = item.get(grid_key)
+            if grid is None:
+                return None
+            grids.append(torch.as_tensor(grid, dtype=torch.long))
+
+        if not grids:
+            return None
+        return torch.stack(grids, dim=0)
+
+    def build_decode_only_mm_data(self, prompt, request_obj):
+        """Build lightweight multimodal inputs for decode without features/embeddings.
+
+        This path is intended for PD decode requests that already have KV cache and only
+        need multimodal token expansion / M-RoPE metadata, not local preprocessing or
+        encoder outputs.
+        """
+        if getattr(request_obj, "audio_data", None):
+            return None
+
+        image_data = getattr(request_obj, "image_data", None) or []
+        video_data = getattr(request_obj, "video_data", None) or []
+
+        img_grid_thw = self._extract_grid_tensor(image_data, "image_grid_thw")
+        video_grid_thw = self._extract_grid_tensor(video_data, "video_grid_thw")
+
+        has_image = len(image_data) > 0
+        has_video = len(video_data) > 0
+
+        # Decode-only lightweight path currently supports image-only Qwen requests
+        # where the expanded token layout can be reconstructed from grid metadata.
+        if has_video or (has_image and img_grid_thw is None):
+            return None
+        if not has_image:
+            return None
+
+        input_ids, offsets, modality_list = self.build_input_ids(
+            prompt, img_grid_thw=img_grid_thw, video_grid_thw=video_grid_thw
+        )
+        assert all(isinstance(modality, Modality) for modality in modality_list)
+
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
+            image_grid_thw=img_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        mm_items = []
+        image_idx = 0
+        video_idx = 0
+        for modality, offset in zip(modality_list, offsets):
+            item = MultimodalDataItem(modality=modality, offsets=[offset])
+            if modality == Modality.IMAGE:
+                grid = img_grid_thw[image_idx : image_idx + 1]
+                item.model_specific_data["image_grid_thw"] = grid
+                item.hash = hash(
+                    (
+                        modality.value,
+                        tuple(offset),
+                        tuple(grid.flatten().tolist()),
+                    )
+                ) & ((1 << 63) - 1)
+                image_idx += 1
+            elif modality == Modality.VIDEO:
+                grid = video_grid_thw[video_idx : video_idx + 1]
+                item.model_specific_data["video_grid_thw"] = grid
+                item.hash = hash(
+                    (
+                        modality.value,
+                        tuple(offset),
+                        tuple(grid.flatten().tolist()),
+                    )
+                ) & ((1 << 63) - 1)
+                video_idx += 1
+            item.pad_value = _compute_pad_value(item.hash)
+            mm_items.append(item)
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)

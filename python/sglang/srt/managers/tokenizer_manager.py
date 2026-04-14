@@ -769,6 +769,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
             if (
+                self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
+                and hasattr(self.mm_processor, "build_decode_only_mm_data")
+            ):
+                mm_inputs = self.mm_processor.build_decode_only_mm_data(
+                    prompt=(input_text or input_ids), request_obj=obj
+                )
+                if mm_inputs is not None:
+                    logger.info(
+                        "mm_path: rid=%s using decode-only lightweight mm path",
+                        getattr(obj, "rid", "anonymous_rid"),
+                    )
+
+            if mm_inputs is None and (
                 not self.server_args.language_only
                 or self.server_args.encoder_transfer_backend
                 in ["zmq_to_tokenizer", "mooncake"]
