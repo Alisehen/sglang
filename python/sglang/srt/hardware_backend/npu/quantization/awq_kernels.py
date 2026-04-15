@@ -30,7 +30,9 @@ class AWQAscendLinearKernel:
         for i in range(0, self.quant_config.pack_factor):
             shift_num = shifts[i] * 4
             qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(((layer.qweight.data >> shift_num) & 0xF) << (4 * i))
+            qweight_tmp.bitwise_or_(
+                ((layer.qweight.data >> shift_num) & 0xF) << (4 * i)
+            )
 
         qweight_tmp.bitwise_xor_(0x88888888)
 
