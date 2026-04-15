@@ -9,13 +9,6 @@ import torch
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
-from .schemes import (
-    AWQAscendLinearScheme,
-    AWQAscendMoEScheme,
-    AWQLinearScheme,
-    AWQMarlinLinearScheme,
-    AWQMoEScheme,
-)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -31,6 +24,14 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+from .schemes import (
+    AWQAscendLinearScheme,
+    AWQAscendMoEScheme,
+    AWQLinearScheme,
+    AWQMarlinLinearScheme,
+    AWQMoEScheme,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
