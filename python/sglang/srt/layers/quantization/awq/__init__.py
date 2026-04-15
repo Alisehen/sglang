@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .awq import AWQConfig, AWQMarlinConfig
+from .awq_triton import awq_dequantize_decomposition, awq_dequantize_triton
 from .schemes import (
     AWQAscendLinearScheme,
     AWQAscendMoEScheme,
@@ -8,7 +9,6 @@ from .schemes import (
     AWQMarlinLinearScheme,
     AWQMoEScheme,
 )
-from .awq_triton import awq_dequantize_decomposition, awq_dequantize_triton
 
 __all__ = [
     "AWQConfig",
