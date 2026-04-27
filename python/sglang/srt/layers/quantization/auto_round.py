@@ -258,8 +258,8 @@ class AutoRoundConfig(QuantizationConfig):
             use_marlin = False
         if use_marlin:
             from sglang.srt.layers.quantization.awq import (
+                AWQLinearMethod,
                 AWQMarlinConfig,
-                AWQMarlinLinearMethod,
                 AWQMoEMethod,
             )
 
@@ -296,7 +296,7 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
-                return AWQMarlinLinearMethod(quant_args_marlin)
+                return AWQLinearMethod(quant_args_marlin)
             else:
                 return AWQLinearMethod(quant_args)
         return None

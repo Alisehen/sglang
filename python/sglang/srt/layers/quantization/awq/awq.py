@@ -28,6 +28,8 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 from .schemes import (
     AWQAscendLinearScheme,
     AWQAscendMoEScheme,
+    AWQIntelAMXLinearScheme,
+    AWQIntelAMXMoEScheme,
     AWQLinearScheme,
     AWQMarlinLinearScheme,
     AWQMoEScheme,
@@ -169,6 +171,41 @@ class AWQConfig(QuantizationConfig):
         raise NotImplementedError("AWQConfig only supports MoE scheme on NPU.")
 
 
+class AWQCPUConfig(AWQConfig):
+    """CPU Config class for AWQ, inherit from AWQConfig"""
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                return UnquantizedLinearMethod()
+            layer.scheme = self.get_linear_scheme(layer)
+            return AWQLinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            layer.scheme = self.get_moe_scheme(layer)
+            return AWQMoEMethod(self)
+        return None
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.linear import LinearBase
+
+        assert isinstance(layer, LinearBase)
+        return AWQIntelAMXLinearScheme(self)
+
+    def get_moe_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        assert isinstance(layer, FusedMoE)
+        return AWQIntelAMXMoEScheme(self)
+
+
 class AWQMarlinConfig(QuantizationConfig):
     """Config class for AWQ Marlin"""
 
@@ -299,7 +336,7 @@ class AWQMarlinConfig(QuantizationConfig):
                 )
                 return AWQConfig.from_config(self.full_config).get_quant_method(
                     layer, prefix
-                )
+            )
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
