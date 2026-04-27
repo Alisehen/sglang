@@ -336,7 +336,7 @@ class AWQMarlinConfig(QuantizationConfig):
                 )
                 return AWQConfig.from_config(self.full_config).get_quant_method(
                     layer, prefix
-            )
+                )
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
