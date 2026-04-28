@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import AWQMoEKernel
 from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -26,9 +25,16 @@ __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
 class AWQMoEScheme(AWQMoESchemeBase):
     def __init__(self, quant_config: "AWQMarlinConfig"):
         self.quant_config = quant_config
-        self.kernel = AWQMoEKernel(quant_config)
         if self.quant_config.weight_bits != 4:
             raise ValueError("AWQMoEScheme only supports 4bit now.")
+        self.kernel = self._init_kernel(quant_config)
+
+    def _init_kernel(self, quant_config: "AWQMarlinConfig"):
+        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
+            AWQMoEKernel,
+        )
+
+        return AWQMoEKernel(quant_config)
 
     def create_weights(
         self,
@@ -137,13 +143,12 @@ class AWQMoEScheme(AWQMoESchemeBase):
 
 
 class AWQAscendMoEScheme(AWQMoEScheme):
-    def __init__(self, quant_config: "AWQConfig"):
-        super().__init__(quant_config)
+    def _init_kernel(self, quant_config: "AWQConfig"):
         from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
             AWQAscendMoEKernel,
         )
 
-        self.kernel = AWQAscendMoEKernel(quant_config)
+        return AWQAscendMoEKernel(quant_config)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

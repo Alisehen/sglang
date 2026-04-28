@@ -55,7 +55,6 @@ logger = logging.getLogger(__name__)
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
     "AWQLinearMethod",
-    "AWQLinearAscendMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",

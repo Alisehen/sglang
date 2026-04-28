@@ -158,6 +158,8 @@ class AWQConfig(QuantizationConfig):
 
     def get_linear_scheme(self, layer: torch.nn.Module):
         assert isinstance(layer, LinearBase)
+        # TODO: move platform-specific AWQ scheme selection into the platform
+        # plugin factory once quantization hooks are available there.
         if _is_npu:
             return AWQAscendLinearScheme(self)
         return AWQLinearScheme(self)
@@ -166,6 +168,7 @@ class AWQConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         assert isinstance(layer, FusedMoE)
+        # This is currently only reached by the NPU path in get_quant_method.
         if _is_npu:
             return AWQAscendMoEScheme(self)
         raise NotImplementedError("AWQConfig only supports MoE scheme on NPU.")

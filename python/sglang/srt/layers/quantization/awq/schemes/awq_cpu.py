@@ -21,9 +21,7 @@ if TYPE_CHECKING:
 __all__ = ["AWQIntelAMXLinearScheme", "AWQIntelAMXMoEScheme"]
 
 
-class AWQIntelAMXLinearScheme(AWQLinearScheme):
-    """Linear scheme for AWQ on Intel CPU with AMX."""
-
+class AWQIntelAMXLinearKernel:
     def __init__(self, quant_config: "AWQConfig"):
         self.quant_config = quant_config
 
@@ -35,7 +33,7 @@ class AWQIntelAMXLinearScheme(AWQLinearScheme):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-    def apply_weights(
+    def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -50,13 +48,16 @@ class AWQIntelAMXLinearScheme(AWQLinearScheme):
         )
 
 
-class AWQIntelAMXMoEScheme(AWQMoEScheme):
-    """MoE scheme for AWQ on Intel CPU with AMX."""
+class AWQIntelAMXLinearScheme(AWQLinearScheme):
+    """Linear scheme for AWQ on Intel CPU with AMX."""
 
+    def _init_kernel(self, quant_config: "AWQConfig"):
+        return AWQIntelAMXLinearKernel(quant_config)
+
+
+class AWQIntelAMXMoEKernel:
     def __init__(self, quant_config: "AWQConfig"):
         self.quant_config = quant_config
-        if self.quant_config.weight_bits != 4:
-            raise ValueError("AWQIntelAMXMoEScheme only supports 4bit now.")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _amx_process_weight_after_loading(
@@ -71,7 +72,7 @@ class AWQIntelAMXMoEScheme(AWQMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
 
-    def apply_weights(
+    def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
@@ -101,3 +102,16 @@ class AWQIntelAMXMoEScheme(AWQMoEScheme):
             True,  # is_vnni
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class AWQIntelAMXMoEScheme(AWQMoEScheme):
+    """MoE scheme for AWQ on Intel CPU with AMX."""
+
+    def _init_kernel(self, quant_config: "AWQConfig"):
+        return AWQIntelAMXMoEKernel(quant_config)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.kernel.create_moe_runner(layer, moe_runner_config)

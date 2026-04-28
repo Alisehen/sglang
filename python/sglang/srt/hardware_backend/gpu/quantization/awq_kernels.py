@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+from sglang.srt.utils import is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,30 +35,36 @@ def _unsupported_awq_dequantize(*args, **kwargs):
 
 awq_dequantize = _unsupported_awq_dequantize
 
-try:
-    from sglang.jit_kernel.awq_dequantize import awq_dequantize
-    from sglang.jit_kernel.awq_marlin_repack import (
-        awq_marlin_moe_repack,
-        awq_marlin_repack,
-    )
-    from sglang.srt.utils.custom_op import register_custom_op_from_extern
-
-    awq_dequantize = register_custom_op_from_extern(
-        awq_dequantize,
-        fake_impl=lambda qweight, scales, qzeros: qweight.new_empty(
-            qweight.shape[:-1] + (qweight.shape[-1] * 8,), dtype=scales.dtype
-        ),
-    )
-except ImportError:
+if is_xpu():
     try:
-        from sglang.srt.layers.quantization.awq.awq_triton import (
-            awq_dequantize_triton as awq_dequantize,
+        from sgl_kernel import awq_dequantize
+    except ImportError:
+        pass
+else:
+    try:
+        from sglang.jit_kernel.awq_dequantize import awq_dequantize
+        from sglang.jit_kernel.awq_marlin_repack import (
+            awq_marlin_moe_repack,
+            awq_marlin_repack,
+        )
+        from sglang.srt.utils.custom_op import register_custom_op_from_extern
+
+        awq_dequantize = register_custom_op_from_extern(
+            awq_dequantize,
+            fake_impl=lambda qweight, scales, qzeros: qweight.new_empty(
+                qweight.shape[:-1] + (qweight.shape[-1] * 8,), dtype=scales.dtype
+            ),
         )
     except ImportError:
         try:
-            from sgl_kernel import awq_dequantize
+            from sglang.srt.layers.quantization.awq.awq_triton import (
+                awq_dequantize_triton as awq_dequantize,
+            )
         except ImportError:
-            pass
+            try:
+                from sgl_kernel import awq_dequantize
+            except ImportError:
+                pass
 
 _, scalar_types = get_scalar_types()
 
