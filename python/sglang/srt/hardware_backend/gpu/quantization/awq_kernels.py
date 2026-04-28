@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -38,6 +38,13 @@ awq_dequantize = _unsupported_awq_dequantize
 if is_xpu():
     try:
         from sgl_kernel import awq_dequantize
+    except ImportError:
+        pass
+elif is_hip():
+    try:
+        from sglang.srt.layers.quantization.awq.awq_triton import (
+            awq_dequantize_triton as awq_dequantize,
+        )
     except ImportError:
         pass
 else:
