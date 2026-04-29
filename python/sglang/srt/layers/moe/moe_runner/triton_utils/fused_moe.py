@@ -12,7 +12,10 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.layers.moe.utils import (
+    get_moe_padding_size,
+    swiglu_with_alpha_and_limit,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -311,16 +314,6 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
     return gate * up
 
 
-@torch.compile
-def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
-    # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
-    # At present, only GPT-OSS uses this variant.
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=gemm1_limit)
-    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
-
-
 @functools.lru_cache()
 def _down_moe_use_tma():
     return support_tensor_descriptor()
@@ -521,7 +514,7 @@ def _fused_moe_kernel_sequence(
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+            intermediate_cache2 = swiglu_with_alpha_and_limit(
                 intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
             )
         elif gemm1_limit is not None:
