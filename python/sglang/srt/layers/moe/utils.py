@@ -20,16 +20,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@torch.compile
-def swiglu_with_alpha_and_limit(
-    x: torch.Tensor, gemm1_alpha: float, gemm1_limit: float
-) -> torch.Tensor:
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=gemm1_limit)
-    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
-
-
 class MoeA2ABackend(Enum):
 
     NONE = "none"
